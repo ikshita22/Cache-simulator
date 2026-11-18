@@ -1,4 +1,5 @@
 import argparse
+from contextlib import ExitStack
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -6,6 +7,7 @@ import sys
 from typing import TextIO
 
 from .model import AccessResult, CacheConfig, Simulator
+from .parallel import run_parallel
 from .trace import parse_trace
 
 
@@ -13,7 +15,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Simulate private write-back caches with snooping MESI coherence."
     )
-    parser.add_argument("trace", help="trace file, or - for standard input")
+    parser.add_argument("trace", nargs="?", help="combined trace file, or - for standard input")
+    parser.add_argument(
+        "--core-traces", nargs="+", metavar="FILE",
+        help="run one worker per core; files are assigned to cores in argument order",
+    )
     defaults = CacheConfig()
     for name in (
         "cores", "sets", "ways", "block_size", "hit_latency",
@@ -47,12 +53,30 @@ def _run(
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if (args.trace is None) == (args.core_traces is None):
+        parser.error("provide either a combined trace or --core-traces, not both")
     try:
         config = CacheConfig(**{
             name: getattr(args, name) for name in CacheConfig.__dataclass_fields__
         })
         simulator = Simulator(config)
-        if args.trace == "-":
+        if args.core_traces is not None:
+            if len(args.core_traces) != config.cores:
+                raise ValueError(
+                    f"expected {config.cores} per-core traces, got {len(args.core_traces)}"
+                )
+            if "-" in args.core_traces:
+                raise ValueError("--core-traces requires files; stdin is only supported for a combined trace")
+            with ExitStack() as stack:
+                traces = [
+                    parse_trace(
+                        stack.enter_context(Path(path).open(encoding="utf-8")),
+                        config.cores, path, core_id=core,
+                    )
+                    for core, path in enumerate(args.core_traces)
+                ]
+                results = run_parallel(simulator, traces, record_events=args.events)
+        elif args.trace == "-":
             results = _run(sys.stdin, simulator, "<stdin>", args.events)
         else:
             with Path(args.trace).open(encoding="utf-8") as stream:
@@ -61,6 +85,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(error))
 
     report = simulator.report()
+    threaded = args.core_traces is not None
+    report["execution"] = {
+        "mode": "threaded" if threaded else "serial",
+        "workers": config.cores if threaded else 1,
+        "arbitration": "round-robin" if threaded else "trace-order",
+    }
     if args.json:
         if args.events:
             report["events"] = [asdict(result) for result in results]
@@ -75,7 +105,8 @@ def main(argv: list[str] | None = None) -> int:
                     f"{result.bus_transaction or '-'} "
                     f"cycles={result.cycles} end={result.end_cycle}"
                 )
-        print("MESI cache simulator (serialized trace order)")
+        mode = "threaded cores, round-robin arbitration" if threaded else "serialized trace order"
+        print(f"MESI cache simulator ({mode})")
         print(
             f"{config.cores} cores | {config.sets} sets | {config.ways}-way | "
             f"{config.block_size} B blocks | "

@@ -31,6 +31,21 @@ class TraceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             list(parse_trace([], cores=0))
 
+    def test_per_core_trace_format_reuses_address_rules_and_line_numbers(self) -> None:
+        accesses = list(parse_trace(
+            ["# heading", "", "r 0x10 # read", "W 0017"],
+            core_id=2,
+        ))
+        self.assertEqual(accesses, [TraceAccess(2, "R", 16), TraceAccess(2, "W", 17)])
+        for record in ("2 R 0", "R", "R ff", "W -1", "X 0"):
+            with self.subTest(record=record):
+                with self.assertRaisesRegex(TraceError, "core2.trace:2:"):
+                    list(parse_trace(["", record], source="core2.trace", core_id=2))
+        for core in (-1, 4, True, 1.5):
+            with self.subTest(core=core):
+                with self.assertRaisesRegex(ValueError, "core_id"):
+                    list(parse_trace([], core_id=core))
+
 
 if __name__ == "__main__":
     unittest.main()

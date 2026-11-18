@@ -1,6 +1,7 @@
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from enum import Enum
+from threading import Lock
 
 
 class State(str, Enum):
@@ -109,6 +110,7 @@ class Simulator:
         self._caches: list[dict[int, OrderedDict[int, State]]] = [
             {} for _ in range(self.config.cores)
         ]
+        self._lock = Lock()
 
     def _validate_access(self, core: int, address: int) -> None:
         if type(core) is not int or not 0 <= core < self.config.cores:
@@ -123,13 +125,17 @@ class Simulator:
     def state(self, core: int, address: int) -> State:
         self._validate_access(core, address)
         block, index = self._location(address)
-        return self._caches[core].get(index, {}).get(block, State.INVALID)
+        with self._lock:
+            return self._caches[core].get(index, {}).get(block, State.INVALID)
 
     def access(self, core: int, operation: str, address: int) -> AccessResult:
         self._validate_access(core, address)
         if operation not in ("R", "W"):
             raise ValueError("operation must be R or W")
+        with self._lock:
+            return self._access(core, operation, address)
 
+    def _access(self, core: int, operation: str, address: int) -> AccessResult:
         config = self.config
         stats = self.core_stats[core]
         block, index = self._location(address)
@@ -249,6 +255,10 @@ class Simulator:
         return peers
 
     def report(self) -> dict[str, object]:
+        with self._lock:
+            return self._report()
+
+    def _report(self) -> dict[str, object]:
         cores = [stats.report() for stats in self.core_stats]
         accesses = sum(stats.reads + stats.writes for stats in self.core_stats)
         misses = sum(stats.read_misses + stats.write_misses for stats in self.core_stats)

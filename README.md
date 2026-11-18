@@ -3,7 +3,8 @@
 A dependency-free Python simulator for private, set-associative caches in a
 multi-core processor. It implements snooping MESI coherence, per-core LRU
 replacement, and write-back/write-allocate caching. Four cores are simulated by
-default.
+default. It supports both ordered single-trace replay and host-threaded
+execution with one worker per core.
 
 ## Requirements and running
 
@@ -15,6 +16,7 @@ python -m cache_simulator examples\mesi.trace
 python -m cache_simulator examples\mesi.trace --json --events
 python -m cache_simulator examples\lru.trace --sets 1 --ways 2 --block-size 16
 python -m cache_simulator examples\private.trace --cores 4 --ways 8
+python -m cache_simulator --core-traces examples\core0.trace examples\core1.trace examples\core2.trace examples\core3.trace --events
 python -m cache_simulator --help
 ```
 
@@ -47,6 +49,21 @@ Each access touches the single block containing its address, regardless of
 alignment. Traces do not include access sizes, data values, timestamps, or
 instruction execution.
 
+### Per-core traces
+
+Use `--core-traces` to enable threaded execution. Supply exactly one file per
+configured core, in core-ID order. Each file omits the core column:
+
+```text
+R 0x1000
+W 0x1008
+```
+
+Address syntax, comments, and validation are otherwise unchanged. A bare
+number such as `1000` is decimal; use `0x1000` for hexadecimal. A combined
+trace and `--core-traces` cannot be used together. Standard input is supported
+only for combined traces. Empty per-core files are allowed.
+
 ## Configuration
 
 | Option | Default | Meaning |
@@ -61,6 +78,7 @@ instruction execution.
 | `--transfer-latency` | 10 | Cost per full-block peer-cache transfer |
 | `--json` | off | Machine-readable statistics |
 | `--events` | off | Per-access states, bus operation, and cycle costs |
+| `--core-traces FILE ...` | off | Threaded execution; one file per core |
 
 All numerical options must be positive integers. Cache capacity per core is
 `sets * ways * block_size` bytes, excluding metadata. The default is 16 KiB
@@ -94,12 +112,33 @@ but not charged as memory writes at trace end.
 
 ## Execution and timing model
 
-This is a deterministic functional simulation of multiple cores, **not
-host-thread parallel execution**. The combined trace defines a total order
-of atomic accesses. All caches observe that same order through one serialized
-snooping bus. Requests, cache lookups, transfers, and memory work do not
-overlap; there is no attempt to predict out-of-order core performance or
-parallel speedup.
+With a combined trace, accesses execute on the calling thread in file order.
+With `--core-traces`, the simulator starts one actual host worker thread per
+core. Workers read their own traces concurrently and submit accesses in
+deterministic round-robin order: core 0, core 1, and so on, then repeat.
+Each active core gets one access per turn; exhausted cores are skipped.
+An empty or shorter trace never prevents the other cores from finishing.
+This arbitration is independent of host thread scheduling and does not
+prioritize a core based on its modeled cycle count.
+
+A condition variable coordinates turns. The simulator also protects every
+complete cache access with a shared lock, including local hits, evictions,
+peer snoops, state transitions, and statistics. State inspection and report
+snapshots use the same lock. This prevents a snoop from racing with another
+core's local access. Failed reads or accesses cancel waiting workers, and
+all workers are joined before an error is returned. A failed API run may
+leave earlier successful accesses in the simulator; the CLI emits no partial
+report.
+
+**Threaded execution does not imply overlapping simulated cycles or a
+performance speedup.** Both modes retain the same conservative, atomic-access
+timing model. Cache lookups, bus transfers, and memory operations are
+serialized; total cycles are service costs, not the elapsed runtime of an
+overlapping multi-core processor. Python's GIL normally prevents parallel
+execution of Python bytecode, and the shared coherence lock further limits
+concurrency. Trace reads can overlap, but no host-runtime speedup is promised.
+There is no out-of-order pipeline, per-core compute timing, idle-cycle model,
+or cycle-accurate bus contention model.
 
 Each access pays the lookup cost. A miss or S-state write also pays one bus
 transaction cost. A miss then pays either a memory read cost or a peer
@@ -132,7 +171,10 @@ invalidations, bus operation counts, transfers, and memory/data traffic.
 `--json` additionally exposes separate read/write counters and miss rates,
 upgrades, intervention writebacks, final resident-state counts, and all
 configuration values. `--events` adds per-access results; without it the
-trace is streamed without retaining access history.
+trace is streamed without retaining access history. Threaded mode holds at
+most one pending access per core in addition to cache contents. CLI JSON
+includes an `execution` object with the mode, worker count, and arbitration
+policy.
 
 - A hit means a valid local line was present, so an S-to-M upgrade is a
   **write hit**, not a miss.
@@ -154,6 +196,8 @@ For `examples\mesi.trace`, defaults yield 7 accesses, 3 hits, 4 misses,
 447 cycles, 1 memory read, 3 memory writes, and 3 peer transfers.
 For `examples\lru.trace` with the configuration above, expect 6 accesses,
 5 misses, 3 evictions (1 dirty), and 618 cycles.
+The four `examples\core*.trace` files together yield 8 accesses, 6 misses,
+552 cycles, 3 memory reads, and 2 memory writes.
 
 ## Python API
 
@@ -168,10 +212,33 @@ assert sim.state(0, 0x1000) == "S"
 report = sim.report()
 ```
 
+For threaded replay, provide a separate iterable of accesses for each core:
+
+```python
+from cache_simulator import CacheConfig, Simulator, TraceAccess, run_parallel
+
+sim = Simulator(CacheConfig(cores=2))
+events = run_parallel(sim, [
+    [TraceAccess(0, "R", 0x1000), TraceAccess(0, "W", 0x1000)],
+    [TraceAccess(1, "R", 0x1000)],
+], record_events=True)
+assert [event.core for event in events] == [0, 1, 0]
+```
+
+`parse_trace(stream, cores=2, source="core0.trace", core_id=0)` parses a
+two-column per-core trace lazily. Each iterable passed to `run_parallel`
+is read exclusively by its assigned worker and must contain only that
+core's accesses. Without `record_events=True`, the return value is an empty
+list and no history is retained. The API does not close caller-owned streams.
+
 The API accepts `R` and `W` in uppercase and raises `ValueError` for invalid
 requests before mutating simulation state. `state()` observes a block
-without changing its LRU position. A simulator instance is mutable and
-not thread-safe.
+without changing its LRU position. `access()`, `state()`, and `report()` are
+synchronized. Treat the exposed statistics and configuration as read-only;
+use `report()` for a consistent snapshot during execution. Direct concurrent
+`access()` calls are safe but their ordering depends on host scheduling.
+Use `run_parallel()` without external callers for reproducible round-robin
+ordering.
 
 ## Validation
 
@@ -184,3 +251,6 @@ silent E-to-M and M hits, dirty interventions and evictions, LRU and set
 mapping, write allocation, exact cycle/traffic accounting, trace errors,
 and CLI output. Seeded multi-core traces also check coherence and capacity
 invariants after every access across 1-, 2-, 4-, and 8-way caches.
+Threaded tests verify distinct core workers, repeatable round-robin ordering,
+equivalence to serial replay, unequal and empty trace lengths, synchronized
+direct access, and worker/read/startup error cleanup.

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def run_cli(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, "-m", "cache_simulator", *args],
-        input=stdin, text=True, capture_output=True, cwd=ROOT, check=False,
+        input=stdin, text=True, capture_output=True, cwd=ROOT, check=False, timeout=15,
     )
 
 
@@ -77,6 +77,68 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
         self.assertIn("decode", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_threaded_examples_match_round_robin_trace(self) -> None:
+        paths = [str(ROOT / "examples" / f"core{core}.trace") for core in range(4)]
+        result = run_cli("--core-traces", *paths, "--json", "--events")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(result.stdout)
+        serial = run_cli("-", "--json", "--events", stdin=(
+            "0 R 0x1000\n1 R 0x1000\n2 R 0x2000\n3 W 0x3000\n"
+            "0 W 0x1000\n1 W 0x1000\n2 R 0x2008\n3 R 0x1000\n"
+        ))
+        self.assertEqual(serial.returncode, 0, serial.stderr)
+        expected = json.loads(serial.stdout)
+        self.assertEqual(actual.pop("execution"), {
+            "mode": "threaded", "workers": 4, "arbitration": "round-robin",
+        })
+        expected.pop("execution")
+        self.assertEqual(actual, expected)
+        text = run_cli("--core-traces", *paths)
+        self.assertEqual(text.returncode, 0, text.stderr)
+        self.assertIn("threaded cores, round-robin arbitration", text.stdout)
+        self.assertIn("Cycles: 552", text.stdout)
+
+    def test_threaded_invalid_arguments_and_worker_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            good = Path(directory) / "good.trace"
+            bad = Path(directory) / "bad.trace"
+            invalid_utf8 = Path(directory) / "invalid.trace"
+            good.write_text("R 0\nW 0\n" * 50, encoding="utf-8")
+            bad.write_text("# comment\nR invalid\n", encoding="utf-8")
+            invalid_utf8.write_bytes(b"\xff")
+            for args, message in [
+                ([], "provide either"),
+                (["-", "--core-traces", str(good)], "provide either"),
+                (["--core-traces", str(good)], "expected 4 per-core traces"),
+                (["--core-traces", "-", "-", "-", "-"], "requires files"),
+                (["--core-traces", str(good), str(bad), str(good), str(good)],
+                 f"{bad}:2:"),
+                (["--core-traces", str(good), str(invalid_utf8), str(good), str(good)],
+                 "decode"),
+                (["--core-traces", str(good), str(Path(directory) / "missing"),
+                  str(good), str(good)], "error:"),
+            ]:
+                with self.subTest(args=args):
+                    result = run_cli(*args)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, "")
+                    self.assertIn(message, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+
+    def test_threaded_single_core_and_empty_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "core.trace"
+            path.write_text("# empty\n", encoding="utf-8")
+            result = run_cli("--cores", "1", "--core-traces", str(path), "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report["summary"]["cycles"], 0)
+            self.assertNotIn("events", report)
+            path.write_text("W 0\nR 0\n", encoding="utf-8")
+            result = run_cli("--cores", "1", "--core-traces", str(path), "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["summary"]["cycles"], 104)
 
 
 if __name__ == "__main__":

@@ -15,16 +15,25 @@ class TraceAccess:
 
 
 def parse_trace(
-    lines: Iterable[str], cores: int = 4, source: str = "<trace>"
+    lines: Iterable[str], cores: int = 4, source: str = "<trace>",
+    *, core_id: int | None = None,
 ) -> Iterator[TraceAccess]:
     if type(cores) is not int or cores <= 0:
         raise ValueError("cores must be a positive integer")
+    if core_id is not None and (
+        type(core_id) is not int or not 0 <= core_id < cores
+    ):
+        raise ValueError(f"core_id must be between 0 and {cores - 1}")
     for number, line in enumerate(lines, 1):
         content = line.partition("#")[0].strip()
         if not content:
             continue
         fields = content.split()
         try:
+            if core_id is not None:
+                if len(fields) != 2:
+                    raise ValueError("expected: <R|W> <address>")
+                fields.insert(0, str(core_id))
             if len(fields) != 3:
                 raise ValueError("expected: <core> <R|W> <address>")
             core_text, operation, address_text = fields
