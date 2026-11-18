@@ -1,0 +1,7 @@
+# Run with --sets 1 --ways 2 --block-size 16.
+0 W 0x00
+0 R 0x10
+0 R 0x04
+0 R 0x20
+0 R 0x30
+0 R 0x00
